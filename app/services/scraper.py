@@ -299,7 +299,6 @@ def create_schedule_png(data, target, date_str, role="student"):
         time_logic = {
             "1": ("08:00", "09:40"), "2": ("09:50", "11:30"),
             "3": ("11:40", "13:20"), "4": ("13:30", "15:10"),
-            # Запасные, если вдруг поставят пары позже в субботу
             "5": ("15:20", "17:00"), "6": ("17:10", "18:50"), "7": ("19:00", "20:40")
         }
         c_map = {
@@ -309,7 +308,6 @@ def create_schedule_png(data, target, date_str, role="student"):
             "7": "19:00 – 19:45\n19:55 – 20:40"
         }
     else:
-
         time_logic = {
             "1": ("08:00", "09:40"), "2": ("09:50", "11:30"),
             "3": ("12:00", "13:40"), "4": ("13:50", "15:25"),
@@ -429,14 +427,22 @@ def create_schedule_png(data, target, date_str, role="student"):
         draw.line([COL1_W, curr_y, COL1_W, curr_y + r['h']], fill=COLOR_GRID, width=2)
         draw.line([COL1_W + COL2_W, curr_y, COL1_W + COL2_W, curr_y + r['h']], fill=COLOR_GRID, width=2)
 
+        # ====================================================================
+        # ВЛАД, ВНИМАНИЕ! ИСПРАВЛЕНИЯ КООРДИНАТ НАХОДЯТСЯ ЗДЕСЬ (строки 335-343)
+        # ====================================================================
         if r.get('is_current'):
             badge_w, badge_h = 80, 24
-            badge_rect = [COL1_W/2 - badge_w/2, mid_y - 45, COL1_W/2 + badge_w/2, mid_y - 45 + badge_h]
+            # 1. Поднимаем плашку "СЕЙЧАС" выше (сдвиг -60 пикселей вместо -45)
+            badge_y = mid_y - 60
+            badge_rect = [COL1_W/2 - badge_w/2, badge_y, COL1_W/2 + badge_w/2, badge_y + badge_h]
             draw.rounded_rectangle(badge_rect, radius=6, fill=COLOR_LIVE)
-            draw.text((COL1_W/2, mid_y - 45 + badge_h/2 - 1), "СЕЙЧАС", font=f_live, fill=COLOR_TEXT_WHITE, anchor="mm")
-            n_y, t_y = mid_y - 15, mid_y + 15
+            draw.text((COL1_W/2, badge_y + badge_h/2 - 1), "СЕЙЧАС", font=f_live, fill=COLOR_TEXT_WHITE, anchor="mm")
+            
+            # 2. Опускаем текст "3 ПАРА" и Время (n_y это ПАРА, t_y это ВРЕМЯ)
+            n_y, t_y = mid_y - 20, mid_y + 15
         else:
             n_y, t_y = mid_y - 25, mid_y + 10
+        # ====================================================================
 
         draw.text((COL1_W/2, n_y), f"{r['n']} ПАРА", font=f_n, fill=COLOR_TEXT_BLACK, anchor="mm")
         

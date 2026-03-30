@@ -28,13 +28,15 @@ async def init_db():
             curator_group TEXT DEFAULT NULL,
             pending_hash TEXT DEFAULT NULL,
             journal_login TEXT DEFAULT NULL,
-            journal_password TEXT DEFAULT NULL
+            journal_password TEXT DEFAULT NULL,
+            last_message_id INTEGER DEFAULT NULL
         )
     """)
     
     await db.execute("CREATE INDEX IF NOT EXISTS idx_users_notifications ON users(notifications)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_users_target ON users(target)")
     
+    # Автоматическое обновление базы данных (добавляем колонки, если их нет)
     cursor = await db.execute("PRAGMA table_info(users)")
     columns = [row[1] for row in await cursor.fetchall()]
     
@@ -46,6 +48,9 @@ async def init_db():
         await db.execute("ALTER TABLE users ADD COLUMN journal_login TEXT DEFAULT NULL")
     if "journal_password" not in columns:
         await db.execute("ALTER TABLE users ADD COLUMN journal_password TEXT DEFAULT NULL")
+    # === НОВОЕ ПОЛЕ ===
+    if "last_message_id" not in columns:
+        await db.execute("ALTER TABLE users ADD COLUMN last_message_id INTEGER DEFAULT NULL")
         
     await db.commit()
 
@@ -54,8 +59,6 @@ async def get_user(user_id):
     async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
         return await cursor.fetchone()
 
-# === ИСПРАВЛЕНИЕ ТУТ ===
-# Заменили INSERT OR REPLACE на INSERT ... ON CONFLICT DO UPDATE
 async def save_user(user_id, role, target):
     db = await get_db()
     await db.execute(
@@ -69,7 +72,6 @@ async def save_user(user_id, role, target):
         (user_id, role, target)
     )
     await db.commit()
-# ========================
 
 async def toggle_notifications(user_id):
     db = await get_db()
@@ -114,3 +116,15 @@ async def delete_journal_auth(user_id):
         (user_id,)
     )
     await db.commit()
+
+# === НОВЫЕ ФУНКЦИИ ДЛЯ ЗАПОМИНАНИЯ СООБЩЕНИЙ ===
+async def update_last_message_id(user_id, message_id):
+    db = await get_db()
+    await db.execute("UPDATE users SET last_message_id = ? WHERE user_id = ?", (message_id, user_id))
+    await db.commit()
+
+async def get_last_message_id(user_id):
+    db = await get_db()
+    async with db.execute("SELECT last_message_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
+        return res[0] if res else None

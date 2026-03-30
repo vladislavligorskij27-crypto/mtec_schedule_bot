@@ -259,7 +259,8 @@ async def send_sched(message: types.Message):
         caption = f"📅 Расписание на {date_str}\n{label}: {user['target']}"
         
         if cached_file_id:
-            await message.answer_photo(photo=cached_file_id, caption=caption, parse_mode="Markdown")
+            sent_msg = await message.answer_photo(photo=cached_file_id, caption=caption, parse_mode="Markdown")
+            await database.update_last_message_id(message.from_user.id, sent_msg.message_id) # Запоминаем ID
         else:
             wait = await message.answer("⏳ Отрисовка расписания...")
             loop = asyncio.get_running_loop()
@@ -274,6 +275,7 @@ async def send_sched(message: types.Message):
                 parse_mode="Markdown"
             )
             scraper.IMAGE_CACHE[data_hash] = sent_msg.photo[-1].file_id
+            await database.update_last_message_id(message.from_user.id, sent_msg.message_id) # Запоминаем ID
             await wait.delete()
     else:
         await message.answer(f"❌ Данных на {date_str} нет.")
@@ -374,7 +376,6 @@ async def send_morning_schedule(bot: Bot):
         caption = f"☀️ **Доброе утро!**\nВаше расписание на сегодня ({date_str})"
 
         if not file_id:
-            # Отрисовываем 1 раз на всю группу
             loop = asyncio.get_running_loop()
             photo = await loop.run_in_executor(None, scraper.create_schedule_png, data, target, date_str)
             img_bytes = photo.read()
@@ -388,6 +389,7 @@ async def send_morning_schedule(bot: Bot):
                 )
                 file_id = msg.photo[-1].file_id
                 scraper.IMAGE_CACHE[data_hash] = file_id
+                await database.update_last_message_id(uids[0], msg.message_id) # Запоминаем ID
                 await asyncio.sleep(0.05)
             except Exception:
                 pass
@@ -395,13 +397,15 @@ async def send_morning_schedule(bot: Bot):
             if file_id:
                 for uid in uids[1:]:
                     try:
-                        await bot.send_photo(uid, file_id, caption=caption, parse_mode="Markdown")
+                        sent_msg = await bot.send_photo(uid, file_id, caption=caption, parse_mode="Markdown")
+                        await database.update_last_message_id(uid, sent_msg.message_id) # Запоминаем ID
                         await asyncio.sleep(0.05)
                     except: pass
         else:
             for uid in uids:
                 try:
-                    await bot.send_photo(uid, file_id, caption=caption, parse_mode="Markdown")
+                    sent_msg = await bot.send_photo(uid, file_id, caption=caption, parse_mode="Markdown")
+                    await database.update_last_message_id(uid, sent_msg.message_id) # Запоминаем ID
                     await asyncio.sleep(0.05)
                 except: pass
 
@@ -432,16 +436,14 @@ async def scheduled_check_updates(bot: Bot):
         if base_hash:
             new_hashes[target] = f"{date_to_check}_{base_hash}"
 
-    async with db.execute("SELECT user_id, target, last_hash, pending_hash FROM users WHERE notifications = 1") as cursor:
+    async with db.execute("SELECT user_id, target, role, last_hash, pending_hash FROM users WHERE notifications = 1") as cursor:
         users = await cursor.fetchall()
 
     for user in users:
-        u_id, target, last_h, pend_h = user['user_id'], user['target'], user['last_hash'], user['pending_hash']
+        u_id, target, role, last_h, pend_h = user['user_id'], user['target'], user['role'], user['last_hash'], user['pending_hash']
         curr_h = new_hashes.get(target)
         if not curr_h: continue
 
-        # === ИСПРАВЛЕНИЕ ТУТ ===
-        # Извлекаем дату и сам хэш (no_lessons - значит пар нет)
         old_date = last_h.split("_")[0] if last_h and "_" in last_h else None
         curr_base = curr_h.split("_")[1] if "_" in curr_h else curr_h
 
@@ -451,20 +453,49 @@ async def scheduled_check_updates(bot: Bot):
             continue 
 
         if curr_h == pend_h:
-            try:
-                await bot.send_message(u_id, f"🔔 Расписание для **{target}** на **{date_to_check}** обновилось!")
-                await database.update_last_hash(u_id, curr_h)
-                await asyncio.sleep(0.05)
-            except: pass
+            # === МАГИЯ ОБНОВЛЕНИЯ: удаляем старое, присылаем новое ===
+            old_msg_id = await database.get_last_message_id(u_id)
+            if old_msg_id:
+                try:
+                    await bot.delete_message(chat_id=u_id, message_id=old_msg_id)
+                except Exception:
+                    pass 
+            
+            data = await scraper.get_schedule(target, role, date_to_check)
+            
+            if data and data != "error_logic":
+                data_hash = scraper.get_data_hash(data)
+                file_id = scraper.IMAGE_CACHE.get(data_hash)
+                caption = f"🚨 **ВНИМАНИЕ: РАСПИСАНИЕ ИЗМЕНИЛОСЬ!**\nОбновленные данные для **{target}** на **{date_to_check}**"
+                
+                try:
+                    if file_id:
+                        msg = await bot.send_photo(u_id, file_id, caption=caption, parse_mode="Markdown")
+                    else:
+                        loop = asyncio.get_running_loop()
+                        photo = await loop.run_in_executor(None, scraper.create_schedule_png, data, target, date_to_check)
+                        img_bytes = photo.read()
+                        await save_schedule_to_archive(img_bytes, target, date_to_check)
+                        msg = await bot.send_photo(u_id, BufferedInputFile(img_bytes, filename="update.png"), caption=caption, parse_mode="Markdown")
+                        scraper.IMAGE_CACHE[data_hash] = msg.photo[-1].file_id
+                        
+                    await database.update_last_message_id(u_id, msg.message_id)
+                except Exception as e:
+                    logging.error(f"Ошибка отправки обновления: {e}")
+            else:
+                try:
+                    msg = await bot.send_message(u_id, f"🚨 **РАСПИСАНИЕ ИЗМЕНИЛОСЬ!**\nПар для **{target}** на **{date_to_check}** больше нет.", parse_mode="Markdown")
+                    await database.update_last_message_id(u_id, msg.message_id)
+                except:
+                    pass
+
+            await database.update_last_hash(u_id, curr_h)
+            await asyncio.sleep(0.05)
         else:
-            # Умная проверка:
-            # Если день сменился, и расписания НЕТ (no_lessons) -> обновляем тихо, без уведомлений
             if old_date != date_to_check and curr_base == "no_lessons":
                 await database.update_last_hash(u_id, curr_h)
             else:
-                # Во всех остальных случаях (день сменился и ПАРЫ ЕСТЬ, или день тот же и пары изменились) -> готовимся отправлять!
                 await database.update_pending_hash(u_id, curr_h)
-        # ========================
 
 
 @router.message(lambda m: m.text and any(x in m.text for x in ["Сегодня", "Завтра", "Пн"]))
@@ -488,7 +519,8 @@ async def curator_schedule_view_final(message: types.Message):
         caption = f"👨‍🏫 Группа {group}\n📅 {date_str}"
         
         if cached_file_id:
-            await message.answer_photo(photo=cached_file_id, caption=caption)
+            sent_msg = await message.answer_photo(photo=cached_file_id, caption=caption)
+            await database.update_last_message_id(message.from_user.id, sent_msg.message_id)
         else:
             wait = await message.answer(f"⏳ Загрузка расписания {group}...")
             loop = asyncio.get_running_loop()
@@ -498,6 +530,7 @@ async def curator_schedule_view_final(message: types.Message):
             
             sent_msg = await message.answer_photo(BufferedInputFile(img_bytes, filename="sched.png"), caption=caption)
             scraper.IMAGE_CACHE[data_hash] = sent_msg.photo[-1].file_id
+            await database.update_last_message_id(message.from_user.id, sent_msg.message_id)
             await wait.delete()
     else:
         await message.answer(f"❌ На {date_str} данных нет.")

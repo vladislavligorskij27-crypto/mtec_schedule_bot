@@ -47,6 +47,14 @@ class AntiSpamMiddleware(BaseMiddleware):
             "/"
         ]
 
+        # === ИСПРАВЛЕНИЕ ===
+        # Список "быстрых" кнопок навигации, на которые НЕ действует задержка 2 секунды
+        self.safe_callbacks = [
+            "role_", "pref_", "let_", "set_std_", "set_tch_", "curpref_", 
+            "set_cur_", "is_curator_", "back_to", "srch_", "toggle_notif", 
+            "reset_setup", "journal_", "bc_"
+        ]
+
     def _cleanup_cache(self, now: float):
         self.users = {
             uid: data 
@@ -72,7 +80,19 @@ class AntiSpamMiddleware(BaseMiddleware):
             action_text = event.data
             
         if user_id and action_text:
-            is_heavy_request = isinstance(event, CallbackQuery) or any(trigger in action_text for trigger in self.restricted_actions)
+            
+            # === ИСПРАВЛЕНИЕ ===
+            is_heavy_request = False
+            
+            if isinstance(event, CallbackQuery):
+                # Если нажата инлайн-кнопка, проверяем, начинается ли она с безопасного префикса
+                if not any(action_text.startswith(safe) for safe in self.safe_callbacks):
+                    is_heavy_request = True # Если кнопка тяжелая (например, архивы) - врубаем антиспам
+            elif isinstance(event, Message):
+                # Для обычных сообщений проверяем по старому списку
+                if any(trigger in action_text for trigger in self.restricted_actions):
+                    is_heavy_request = True
+            # ===================
             
             if is_heavy_request:
                 now = time.time()

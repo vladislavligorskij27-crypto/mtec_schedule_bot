@@ -440,10 +440,10 @@ async def scheduled_check_updates(bot: Bot):
         curr_h = new_hashes.get(target)
         if not curr_h: continue
 
+        # === ИСПРАВЛЕНИЕ ТУТ ===
+        # Извлекаем дату и сам хэш (no_lessons - значит пар нет)
         old_date = last_h.split("_")[0] if last_h and "_" in last_h else None
-        if old_date != date_to_check:
-            await database.update_last_hash(u_id, curr_h)
-            continue
+        curr_base = curr_h.split("_")[1] if "_" in curr_h else curr_h
 
         if curr_h == last_h:
             if pend_h is not None:
@@ -457,7 +457,15 @@ async def scheduled_check_updates(bot: Bot):
                 await asyncio.sleep(0.05)
             except: pass
         else:
-            await database.update_pending_hash(u_id, curr_h)
+            # Умная проверка:
+            # Если день сменился, и расписания НЕТ (no_lessons) -> обновляем тихо, без уведомлений
+            if old_date != date_to_check and curr_base == "no_lessons":
+                await database.update_last_hash(u_id, curr_h)
+            else:
+                # Во всех остальных случаях (день сменился и ПАРЫ ЕСТЬ, или день тот же и пары изменились) -> готовимся отправлять!
+                await database.update_pending_hash(u_id, curr_h)
+        # ========================
+
 
 @router.message(lambda m: m.text and any(x in m.text for x in ["Сегодня", "Завтра", "Пн"]))
 async def curator_schedule_view_final(message: types.Message):

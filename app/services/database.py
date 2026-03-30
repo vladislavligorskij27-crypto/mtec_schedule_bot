@@ -54,13 +54,22 @@ async def get_user(user_id):
     async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
         return await cursor.fetchone()
 
+# === ИСПРАВЛЕНИЕ ТУТ ===
+# Заменили INSERT OR REPLACE на INSERT ... ON CONFLICT DO UPDATE
 async def save_user(user_id, role, target):
     db = await get_db()
     await db.execute(
-        "INSERT OR REPLACE INTO users (user_id, role, target) VALUES (?, ?, ?)",
+        """
+        INSERT INTO users (user_id, role, target) 
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET 
+            role = excluded.role, 
+            target = excluded.target
+        """,
         (user_id, role, target)
     )
     await db.commit()
+# ========================
 
 async def toggle_notifications(user_id):
     db = await get_db()

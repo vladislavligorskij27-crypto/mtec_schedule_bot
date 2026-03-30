@@ -6,11 +6,11 @@ from aiogram.types import Message, CallbackQuery, TelegramObject
 class AntiSpamMiddleware(BaseMiddleware):
     def __init__(
         self, 
-        limit: float = 2.0, 
-        base_penalty: float = 5.0, 
-        max_penalty: float = 60.0, 
-        penalty_step: float = 5.0,
-        reset_timeout: float = 60.0
+        limit: float = 0.8,         # ВЛАД, ИЗМЕНИЛ ЗДЕСЬ: было 2.0. 0.8 сек - комфортно для человека, но спасет от автокликера
+        base_penalty: float = 2.0,  # Было 5.0. Если чуть поспешил, бан всего 2 секунды, а не 5
+        max_penalty: float = 30.0,  # Было 60.0. Максимальный бан полминуты
+        penalty_step: float = 2.0,  # Было 5.0. Накинут всего 2 сек за повторное нажатие во время бана
+        reset_timeout: float = 30.0 # Было 60.0. Через 30 сек история "грехов" пользователя обнуляется
     ):
         self.limit = limit
         self.base_penalty = base_penalty
@@ -48,7 +48,7 @@ class AntiSpamMiddleware(BaseMiddleware):
         ]
 
         # === ИСПРАВЛЕНИЕ ===
-        # Список "быстрых" кнопок навигации, на которые НЕ действует задержка 2 секунды
+        # Список "быстрых" кнопок навигации, на которые НЕ действует задержка 0.8 секунды
         self.safe_callbacks = [
             "role_", "pref_", "let_", "set_std_", "set_tch_", "curpref_", 
             "set_cur_", "is_curator_", "back_to", "srch_", "toggle_notif", 

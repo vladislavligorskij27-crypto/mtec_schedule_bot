@@ -26,6 +26,10 @@ MONTHS_RU = {
     "09": "Сентябрь", "10": "Октябрь", "11": "Ноябрь", "12": "Декабрь"
 }
 
+# Глобальный словарь для "задержки" (чтобы не слать спам при лагах сайта)
+# Теперь хранит не просто user_id, а пару (user_id, date), чтобы отслеживать задержки для каждого дня отдельно
+update_debounce_cache = {}
+
 class CuratorStates(StatesGroup):
     waiting_for_group_msg = State()
 
@@ -242,10 +246,11 @@ async def test_update_cmd(message: types.Message, bot: Bot):
     user_id = message.from_user.id
     db = await database.get_db()
     
-    await db.execute("UPDATE users SET last_hash = 'test_hash' WHERE user_id = ?", (user_id,))
+    # Теперь мы ставим специальный флаг TEST_ALL. Бот поймет, что нужно сбросить ВСЕ дни!
+    await db.execute("UPDATE users SET last_hash = ? WHERE user_id = ?", ("TEST_ALL", user_id))
     await db.commit()
 
-    await message.answer("🛠 Твой сохраненный хэш расписания сброшен!\n⏳ Имитирую работу фоновой задачи (как будто прошло 5 минут)...")
+    await message.answer("🛠 Твой сохраненный хэш сброшен для **ВСЕХ** дней!\n⏳ Проверяю все даты (3 дня вперед) без задержек...")
     await scheduled_check_updates(bot)
 
 @router.message(F.text.in_(["📅 На сегодня", "⏭️ На завтра", "➡️ На понедельник"]))
@@ -290,6 +295,167 @@ async def send_sched(message: types.Message):
             await wait.delete()
     else:
         await message.answer(f"❌ Данных на {date_str} нет.")
+
+# --- БЛОК: УМНЫЙ просмотр будущих дней (Обычный пользователь) ---
+@router.message(F.text == "🗓 Другие дни")
+async def show_other_days_menu(message: types.Message):
+    user = await database.get_user(message.from_user.id)
+    if not user: return
+    
+    wait_msg = await message.answer("⏳ Проверяю, на какие дни опубликовано расписание...")
+    
+    builder = InlineKeyboardBuilder()
+    now = datetime.datetime.now(MINSK_TZ)
+    day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    
+    dates_info = []
+    tasks = []
+    
+    # Смотрим на неделю вперед
+    for i in range(1, 8):
+        d = now + datetime.timedelta(days=i)
+        if d.weekday() == 6: continue # Пропускаем воскресенье
+        
+        date_str = d.strftime("%d.%m.%Y")
+        dates_info.append((date_str, day_names[d.weekday()]))
+        # Добавляем в список задач (они не выполняются по очереди, а готовятся к массовому запуску)
+        tasks.append(scraper.get_schedule(user['target'], user['role'], date_str))
+        
+    # Выполняем все запросы к сайту ОДНОВРЕМЕННО (очень быстро!)
+    results = await asyncio.gather(*tasks)
+    
+    added = 0
+    # Проходимся по результатам
+    for (date_str, day_name), data in zip(dates_info, results):
+        # Если данные есть, это не ошибка, и пар > 0 (нет "no_lessons")
+        if data and data != "error_logic" and scraper.get_data_hash(data) != "no_lessons":
+            name = f"{date_str} ({day_name})"
+            builder.button(text=name, callback_data=f"show_date_{date_str}")
+            added += 1
+            
+    await wait_msg.delete()
+    
+    if added > 0:
+        builder.adjust(2)
+        await message.answer("🗓 Доступные дни с расписанием:", reply_markup=builder.as_markup())
+    else:
+        await message.answer("📭 Расписание на будущие дни пока не опубликовано.")
+
+@router.callback_query(F.data.startswith("show_date_"))
+async def process_other_days_std(callback: CallbackQuery):
+    await callback.answer()
+    # Отрезаем "show_date_", чтобы получить чистую дату (например, "15.04.2026")
+    date_str = callback.data.replace("show_date_", "") 
+    user = await database.get_user(callback.from_user.id)
+    if not user: return
+    
+    # Запрашиваем расписание именно на эту дату!
+    data = await scraper.get_schedule(user['target'], user['role'], date_str)
+    
+    if data and data != "error_logic":
+        data_hash = scraper.get_data_hash(data)
+        cached_file_id = scraper.IMAGE_CACHE.get(data_hash)
+        
+        label = "👨‍🏫 Преподаватель" if user['role'] == "teacher" else "👥 Группа"
+        caption = f"📅 Расписание на {date_str}\n{label}: {user['target']}"
+        
+        if cached_file_id:
+            sent_msg = await callback.message.answer_photo(photo=cached_file_id, caption=caption, parse_mode="Markdown")
+            await database.update_last_message_id(callback.from_user.id, sent_msg.message_id) 
+        else:
+            wait = await callback.message.answer(f"⏳ Отрисовка расписания на {date_str}...")
+            loop = asyncio.get_running_loop()
+            photo = await loop.run_in_executor(None, scraper.create_schedule_png, data, user['target'], date_str)
+            img_bytes = photo.read()
+            
+            await save_schedule_to_archive(img_bytes, user['target'], date_str)
+            
+            sent_msg = await callback.message.answer_photo(
+                BufferedInputFile(img_bytes, filename="sched.png"), 
+                caption=caption,
+                parse_mode="Markdown"
+            )
+            scraper.IMAGE_CACHE[data_hash] = sent_msg.photo[-1].file_id
+            await database.update_last_message_id(callback.from_user.id, sent_msg.message_id)
+            await wait.delete()
+    else:
+        await callback.message.answer(f"❌ Данных на {date_str} пока нет.")
+
+# --- БЛОК: УМНЫЙ просмотр будущих дней (КУРАТОР) ---
+@router.message(F.text.endswith(": Другие дни"))
+async def show_other_days_curator_menu(message: types.Message):
+    user = await database.get_user(message.from_user.id)
+    if not user or not user['curator_group']: return
+    
+    group = user['curator_group']
+    if not re.search(rf"{re.escape(group)}", message.text): return
+    
+    wait_msg = await message.answer(f"⏳ Проверяю, на какие дни опубликовано расписание для {group}...")
+    
+    builder = InlineKeyboardBuilder()
+    now = datetime.datetime.now(MINSK_TZ)
+    day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    
+    dates_info = []
+    tasks = []
+    
+    for i in range(1, 8):
+        d = now + datetime.timedelta(days=i)
+        if d.weekday() == 6: continue
+        
+        date_str = d.strftime("%d.%m.%Y")
+        dates_info.append((date_str, day_names[d.weekday()]))
+        tasks.append(scraper.get_schedule(group, "student", date_str))
+        
+    results = await asyncio.gather(*tasks)
+    
+    added = 0
+    for (date_str, day_name), data in zip(dates_info, results):
+        if data and data != "error_logic" and scraper.get_data_hash(data) != "no_lessons":
+            name = f"{date_str} ({day_name})"
+            builder.button(text=name, callback_data=f"cur_date_{date_str}")
+            added += 1
+            
+    await wait_msg.delete()
+    
+    if added > 0:
+        builder.adjust(2)
+        await message.answer(f"🗓 Доступные дни для группы {group}:", reply_markup=builder.as_markup())
+    else:
+        await message.answer(f"📭 Расписание для {group} на будущие дни пока не опубликовано.")
+
+@router.callback_query(F.data.startswith("cur_date_"))
+async def process_other_days_cur(callback: CallbackQuery):
+    await callback.answer()
+    date_str = callback.data.replace("cur_date_", "")
+    user = await database.get_user(callback.from_user.id)
+    if not user or not user['curator_group']: return
+    
+    group = user['curator_group']
+    
+    data = await scraper.get_schedule(group, "student", date_str)
+    if data and data != "error_logic":
+        data_hash = scraper.get_data_hash(data)
+        cached_file_id = scraper.IMAGE_CACHE.get(data_hash)
+        caption = f"👨‍🏫 Группа {group}\n📅 {date_str}"
+        
+        if cached_file_id:
+            sent_msg = await callback.message.answer_photo(photo=cached_file_id, caption=caption)
+            await database.update_last_message_id(callback.from_user.id, sent_msg.message_id)
+        else:
+            wait = await callback.message.answer(f"⏳ Загрузка расписания {group}...")
+            loop = asyncio.get_running_loop()
+            photo = await loop.run_in_executor(None, scraper.create_schedule_png, data, group, date_str)
+            img_bytes = photo.read()
+            await save_schedule_to_archive(img_bytes, group, date_str)
+            
+            sent_msg = await callback.message.answer_photo(BufferedInputFile(img_bytes, filename="sched.png"), caption=caption)
+            scraper.IMAGE_CACHE[data_hash] = sent_msg.photo[-1].file_id
+            await database.update_last_message_id(callback.from_user.id, sent_msg.message_id)
+            await wait.delete()
+    else:
+        await callback.message.answer(f"❌ На {date_str} данных пока нет.")
+# --------------------------------------------------------------------------
 
 @router.message(F.text == "🔔 Звонки")
 async def calls(message: types.Message):
@@ -353,6 +519,7 @@ async def show_settings(message: types.Message):
 @router.callback_query(F.data == "toggle_notif")
 async def toggle_notif(callback: CallbackQuery):
     await callback.answer()
+    # ВЛАД: Исправлена опечатка (было fromuser.id вместо from_user.id)
     new_state = await database.toggle_notifications(callback.from_user.id)
     await callback.message.edit_reply_markup(reply_markup=kb.settings_keyboard(new_state))
 
@@ -363,6 +530,11 @@ async def reset_setup(callback: CallbackQuery):
 
 async def send_morning_schedule(bot: Bot):
     now = datetime.datetime.now(MINSK_TZ)
+
+    # ВЛАД: Выровнял 4 пробела для return. В питоне отступы - это очень важно!
+    if now.weekday() == 6:
+        return
+        
     date_str = now.strftime("%d.%m.%Y")
     
     await scraper.build_global_cache(date_str)
@@ -421,14 +593,28 @@ async def send_morning_schedule(bot: Bot):
                 except: pass
 
 async def scheduled_check_updates(bot: Bot):
-    logging.info("⏳ Запуск фоновой проверки обновлений расписания...")
+    global update_debounce_cache
+    logging.info("⏳ Запуск фоновой проверки обновлений (на 3 дня вперед)...")
     now = datetime.datetime.now(MINSK_TZ)
     
-    date_to_check = now.strftime("%d.%m.%Y")
-    if now.hour >= 9:  
-        date_to_check = (now + datetime.timedelta(days=1)).strftime("%d.%m.%Y")
+    today_str = now.strftime("%d.%m.%Y")
+    tomorrow_str = (now + datetime.timedelta(days=1)).strftime("%d.%m.%Y")
+    day3_str = (now + datetime.timedelta(days=2)).strftime("%d.%m.%Y")
+    day4_str = (now + datetime.timedelta(days=3)).strftime("%d.%m.%Y")
 
-    await scraper.build_global_cache(date_to_check)
+    # ВЛАД: Исправлена ошибка с переменными. 
+    # Изначально мы собираем "сырые" дни в raw_days_to_check
+    if now.hour >= 9:
+        raw_days_to_check = [tomorrow_str, day3_str, day4_str]
+    else:
+        raw_days_to_check = [today_str, tomorrow_str, day3_str]
+
+    # А тут создаем пустой чистый список и наполняем его только теми днями, которые НЕ воскресенье
+    days_to_check = []
+    for d_str in raw_days_to_check:
+        d_obj = datetime.datetime.strptime(d_str, "%d.%m.%Y")
+        if d_obj.weekday() != 6:  # 6 - это воскресенье
+            days_to_check.append(d_str)
 
     yesterday = (now - datetime.timedelta(days=1)).strftime("%d.%m.%Y")
     if yesterday in scraper.GLOBAL_SCHEDULE_CACHE:
@@ -440,96 +626,143 @@ async def scheduled_check_updates(bot: Bot):
 
     db = await database.get_db()
     async with db.execute("SELECT user_id, target, role, last_hash FROM users WHERE notifications = 1") as cursor:
-        users = await cursor.fetchall()
+        users_db = await cursor.fetchall()
+        
+    user_hashes = {u['user_id']: (u['last_hash'] or "") for u in users_db}
+    
+    # Сразу находим тех юзеров, которые запросили /test_update (у которых хэш = TEST_ALL)
+    test_users = {u['user_id'] for u in users_db if u['last_hash'] == "TEST_ALL"}
 
     target_to_users = {}
-    for user in users:
+    for user in users_db:
         key = (user['target'], user['role'])
         if key not in target_to_users:
             target_to_users[key] = []
         target_to_users[key].append(user)
 
-    for (target, role), u_list in target_to_users.items():
-        # Парсим свежие данные 1 раз для группы
-        data = await scraper.get_schedule(target, role, date_to_check)
-        curr_base_hash = scraper.get_data_hash(data)
-        curr_h = f"{date_to_check}_{curr_base_hash}"
+    for date_to_check in days_to_check:
+        await scraper.build_global_cache(date_to_check)
 
-        # Отбираем только тех студентов в этой группе, у кого хэш реально не совпадает
-        users_to_notify = [u for u in u_list if u['last_hash'] != curr_h]
+        for (target, role), u_list in target_to_users.items():
+            data = await scraper.get_schedule(target, role, date_to_check)
+            curr_base_hash = scraper.get_data_hash(data)
+            curr_h = f"{date_to_check}_{curr_base_hash}"
 
-        if not users_to_notify:
-            continue 
-
-        logging.info(f"🚨 Найдено обновление для {target} на {date_to_check}! К отправке: {len(users_to_notify)} чел.")
-        
-        file_id = None
-        caption = f"📢 **Внимание: НОВОЕ РАСПИСАНИЕ!**\nСвежие данные для **{target}** на **{date_to_check}**"
-
-        if data and data != "error_logic" and curr_base_hash != "no_lessons":
-            file_id = scraper.IMAGE_CACHE.get(curr_base_hash)
-
-            if not file_id:
-                try:
-                    loop = asyncio.get_running_loop()
-                    photo = await loop.run_in_executor(None, scraper.create_schedule_png, data, target, date_to_check)
-                    img_bytes = photo.read()
-                    await save_schedule_to_archive(img_bytes, target, date_to_check)
-                    
-                    first_user = users_to_notify[0]
-                    u_id = first_user['user_id']
-                    
-                    old_msg_id = await database.get_last_message_id(u_id)
-                    if old_msg_id:
-                        try: await bot.delete_message(chat_id=u_id, message_id=old_msg_id)
-                        except Exception: pass
-                    
-                    msg = await bot.send_photo(
-                        u_id, 
-                        BufferedInputFile(img_bytes, filename="update.png"), 
-                        caption=caption, 
-                        parse_mode="Markdown"
-                    )
-                    
-                    file_id = msg.photo[-1].file_id
-                    scraper.IMAGE_CACHE[curr_base_hash] = file_id
-
-                    await database.update_last_message_id(u_id, msg.message_id)
-                    await database.update_last_hash(u_id, curr_h)
-
-                    users_to_notify = users_to_notify[1:]
-                    await asyncio.sleep(0.05)
-                except Exception as e:
-                    logging.error(f"Ошибка загрузки первого фото для {target}: {e}")
+            is_empty_schedule = (not data or data == "error_logic" or curr_base_hash == "no_lessons")
+            
+            if is_empty_schedule:
+                if date_to_check == today_str:
+                    pass 
+                elif date_to_check == tomorrow_str and now.hour >= 17:
+                    pass 
+                else:
                     continue
 
-        for u in users_to_notify:
-            u_id = u['user_id']
-            try:
-                old_msg_id = await database.get_last_message_id(u_id)
-                if old_msg_id:
-                    try: await bot.delete_message(chat_id=u_id, message_id=old_msg_id)
-                    except Exception: pass
+            final_users_to_notify = []
+
+            for u in u_list:
+                u_id = u['user_id']
+                user_last_hash_str = user_hashes[u_id]
                 
-                if file_id:
-                    msg = await bot.send_photo(u_id, file_id, caption=caption, parse_mode="Markdown")
+                # Проверяем, запустил ли этот юзер тест для всех дней
+                is_global_test = (u_id in test_users)
+                
+                old_hash_for_date = None
+                if not is_global_test:
+                    for part in user_last_hash_str.split('|'):
+                        if part.startswith(date_to_check):
+                            old_hash_for_date = part
+                            break
+                
+                if not is_global_test and old_hash_for_date == curr_h:
+                    continue
+                
+                is_test = is_global_test or (old_hash_for_date and old_hash_for_date.endswith("_test"))
+
+                debounce_key = (u_id, date_to_check)
+
+                if is_test:
+                    final_users_to_notify.append(u_id)
+                    if debounce_key in update_debounce_cache:
+                        del update_debounce_cache[debounce_key]
                 else:
-                    msg = await bot.send_message(
-                        u_id, 
-                        f"🚨 **Внимание!**\nПар для **{target}** на **{date_to_check}** больше нет (или их временно скрыли).", 
-                        parse_mode="Markdown"
-                    )
+                    if update_debounce_cache.get(debounce_key) != curr_h:
+                        update_debounce_cache[debounce_key] = curr_h
+                    else:
+                        final_users_to_notify.append(u_id)
+                        del update_debounce_cache[debounce_key]
 
-                await database.update_last_message_id(u_id, msg.message_id)
-                await database.update_last_hash(u_id, curr_h)
+            if not final_users_to_notify:
+                continue
 
-            except Exception as e:
-                logging.error(f"Ошибка отправки юзеру {u_id}: {e}")
-                if "Forbidden" in str(e) or "bot was blocked" in str(e) or "chat not found" in str(e):
-                    await database.update_last_hash(u_id, curr_h)
+            logging.info(f"🚨 Найдено стабильное обновление для {target} на {date_to_check}! К отправке: {len(final_users_to_notify)} чел.")
+            
+            file_id = None
+            caption = f"📢 **Внимание: НОВОЕ РАСПИСАНИЕ!**\nСвежие данные для **{target}** на **{date_to_check}**"
 
-            await asyncio.sleep(0.05) # Задержка 50мс (20 сообщений в секунду), безопасно для Телеграма
+            if not is_empty_schedule: 
+                file_id = scraper.IMAGE_CACHE.get(curr_base_hash)
 
+                if not file_id:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        photo = await loop.run_in_executor(None, scraper.create_schedule_png, data, target, date_to_check)
+                        img_bytes = photo.read()
+                        await save_schedule_to_archive(img_bytes, target, date_to_check)
+                        
+                        first_uid = final_users_to_notify[0]
+                        
+                        msg = await bot.send_photo(
+                            first_uid, 
+                            BufferedInputFile(img_bytes, filename="update.png"), 
+                            caption=caption, 
+                            parse_mode="Markdown"
+                        )
+                        
+                        file_id = msg.photo[-1].file_id
+                        scraper.IMAGE_CACHE[curr_base_hash] = file_id
+
+                        await database.update_last_message_id(first_uid, msg.message_id)
+                        
+                        # Обновляем память. TEST_ALL удалится сам, останутся только реальные даты
+                        parts = [p for p in user_hashes[first_uid].split('|') if p and p != "TEST_ALL" and not p.startswith(date_to_check)]
+                        parts.append(curr_h)
+                        user_hashes[first_uid] = "|".join(parts[-5:])
+                        await database.update_last_hash(first_uid, user_hashes[first_uid])
+
+                        final_users_to_notify = final_users_to_notify[1:]
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        logging.error(f"Ошибка загрузки первого фото для {target}: {e}")
+                        continue
+
+            for u_id in final_users_to_notify:
+                try:
+                    if file_id:
+                        msg = await bot.send_photo(u_id, file_id, caption=caption, parse_mode="Markdown")
+                    else:
+                        msg = await bot.send_message(
+                            u_id, 
+                            f"🚨 **Внимание!**\nПар для **{target}** на **{date_to_check}** больше нет (или их временно скрыли).", 
+                            parse_mode="Markdown"
+                        )
+
+                    await database.update_last_message_id(u_id, msg.message_id)
+                    
+                    parts = [p for p in user_hashes[u_id].split('|') if p and p != "TEST_ALL" and not p.startswith(date_to_check)]
+                    parts.append(curr_h)
+                    user_hashes[u_id] = "|".join(parts[-5:])
+                    await database.update_last_hash(u_id, user_hashes[u_id])
+
+                except Exception as e:
+                    logging.error(f"Ошибка отправки юзеру {u_id}: {e}")
+                    if "Forbidden" in str(e) or "bot was blocked" in str(e) or "chat not found" in str(e):
+                        parts = [p for p in user_hashes[u_id].split('|') if p and p != "TEST_ALL" and not p.startswith(date_to_check)]
+                        parts.append(curr_h)
+                        user_hashes[u_id] = "|".join(parts[-5:])
+                        await database.update_last_hash(u_id, user_hashes[u_id])
+
+                await asyncio.sleep(0.05) 
 
 @router.message(lambda m: m.text and any(x in m.text for x in ["Сегодня", "Завтра", "Пн"]))
 async def curator_schedule_view_final(message: types.Message):

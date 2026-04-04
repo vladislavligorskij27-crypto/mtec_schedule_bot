@@ -296,7 +296,6 @@ async def send_sched(message: types.Message):
     else:
         await message.answer(f"❌ Данных на {date_str} нет.")
 
-# --- БЛОК: УМНЫЙ просмотр будущих дней (Обычный пользователь) ---
 @router.message(F.text == "🗓 Другие дни")
 async def show_other_days_menu(message: types.Message):
     user = await database.get_user(message.from_user.id)
@@ -321,7 +320,6 @@ async def show_other_days_menu(message: types.Message):
         # Добавляем в список задач (они не выполняются по очереди, а готовятся к массовому запуску)
         tasks.append(scraper.get_schedule(user['target'], user['role'], date_str))
         
-    # Выполняем все запросы к сайту ОДНОВРЕМЕННО (очень быстро!)
     results = await asyncio.gather(*tasks)
     
     added = 0
@@ -381,7 +379,6 @@ async def process_other_days_std(callback: CallbackQuery):
     else:
         await callback.message.answer(f"❌ Данных на {date_str} пока нет.")
 
-# --- БЛОК: УМНЫЙ просмотр будущих дней (КУРАТОР) ---
 @router.message(F.text.endswith(": Другие дни"))
 async def show_other_days_curator_menu(message: types.Message):
     user = await database.get_user(message.from_user.id)
@@ -455,7 +452,6 @@ async def process_other_days_cur(callback: CallbackQuery):
             await wait.delete()
     else:
         await callback.message.answer(f"❌ На {date_str} данных пока нет.")
-# --------------------------------------------------------------------------
 
 @router.message(F.text == "🔔 Звонки")
 async def calls(message: types.Message):
@@ -519,7 +515,6 @@ async def show_settings(message: types.Message):
 @router.callback_query(F.data == "toggle_notif")
 async def toggle_notif(callback: CallbackQuery):
     await callback.answer()
-    # ВЛАД: Исправлена опечатка (было fromuser.id вместо from_user.id)
     new_state = await database.toggle_notifications(callback.from_user.id)
     await callback.message.edit_reply_markup(reply_markup=kb.settings_keyboard(new_state))
 
@@ -531,7 +526,6 @@ async def reset_setup(callback: CallbackQuery):
 async def send_morning_schedule(bot: Bot):
     now = datetime.datetime.now(MINSK_TZ)
 
-    # ВЛАД: Выровнял 4 пробела для return. В питоне отступы - это очень важно!
     if now.weekday() == 6:
         return
         
@@ -602,8 +596,6 @@ async def scheduled_check_updates(bot: Bot):
     day3_str = (now + datetime.timedelta(days=2)).strftime("%d.%m.%Y")
     day4_str = (now + datetime.timedelta(days=3)).strftime("%d.%m.%Y")
 
-    # ВЛАД: Исправлена ошибка с переменными. 
-    # Изначально мы собираем "сырые" дни в raw_days_to_check
     if now.hour >= 9:
         raw_days_to_check = [tomorrow_str, day3_str, day4_str]
     else:
@@ -724,7 +716,6 @@ async def scheduled_check_updates(bot: Bot):
 
                         await database.update_last_message_id(first_uid, msg.message_id)
                         
-                        # Обновляем память. TEST_ALL удалится сам, останутся только реальные даты
                         parts = [p for p in user_hashes[first_uid].split('|') if p and p != "TEST_ALL" and not p.startswith(date_to_check)]
                         parts.append(curr_h)
                         user_hashes[first_uid] = "|".join(parts[-5:])
